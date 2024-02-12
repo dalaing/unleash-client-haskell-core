@@ -64,48 +64,48 @@ data Feature = Feature
 segmentMap :: Maybe [JsonTypes.Segment] -> Map Int [JsonTypes.Constraint]
 segmentMap maybeSegments =
     let segments :: [JsonTypes.Segment] = concat maybeSegments
-     in fromList $ (\segment -> (segment.id, segment.constraints)) <$> segments
+     in fromList $ (\(JsonTypes.Segment id constraints) -> (id, constraints)) <$> segments
 
 -- | Feature toggle set domain transfer object to domain type converter.
 fromJsonFeatures :: JsonTypes.Features -> Features
-fromJsonFeatures jsonFeatures = fromList $ fmap (fromJsonFeature (segmentMap jsonFeatures.segments)) jsonFeatures.features
+fromJsonFeatures (JsonTypes.Features _ features segments) = fromList $ fmap (fromJsonFeature (segmentMap segments)) features
 
 generateRandomText :: MonadIO m => m Text
 generateRandomText = showt <$> randomRIO @Int (0, 99999)
 
 fromJsonFeature :: Map Int [JsonTypes.Constraint] -> JsonTypes.Feature -> (FeatureToggleName, Feature)
-fromJsonFeature segmentMap jsonFeature =
-    ( jsonFeature.name,
+fromJsonFeature segmentMap (JsonTypes.Feature name _ enabled strategies fVariants) =
+    ( name,
       Feature
         { isEnabled = IsEnabled $ \ctx -> do
             isAnyStrategyEnabled <- anyStrategyEnabled ctx
-            pure $ jsonFeature.enabled && (null jsonFeature.strategies || isAnyStrategyEnabled),
+            pure $ enabled && (null strategies || isAnyStrategyEnabled),
           getVariant = GetVariant $ \ctx ->
-            if not jsonFeature.enabled
+            if not enabled
                 then pure emptyVariantResponse
                 else do
-                    let variants :: [Variant] = fromMaybe [] jsonFeature.variants
+                    let variants :: [Variant] = fromMaybe [] fVariants
                     case enabledByOverride variants ctx of
-                        Just variant ->
+                        Just (JsonTypes.Variant name payload _ _ _) ->
                             -- Has overrides
                             pure $
                                 VariantResponse
-                                    { name = variant.name,
-                                      payload = variant.payload,
+                                    { name = name,
+                                      payload = payload,
                                       enabled = True
                                     }
                         Nothing -> do
                             -- Does not have overrides
-                            let maybeStickiness = find ("default" /=) . catMaybes $ (.stickiness) <$> variants
+                            let maybeStickiness = find ("default" /=) . catMaybes $ (JsonTypes.stickiness) <$> variants
                             case maybeStickiness of
                                 Just stickiness -> do
                                     -- Has non-default stickiness
                                     let identifier = lookupContextValue stickiness ctx
-                                    selectVariant variants identifier jsonFeature.name
+                                    selectVariant variants identifier name
                                 Nothing -> do
                                     -- Default stickiness
-                                    let identifier = ctx.userId <|> ctx.sessionId <|> ctx.remoteAddress
-                                    selectVariant variants identifier jsonFeature.name
+                                    let identifier = JsonTypes.userId ctx <|> JsonTypes.sessionId ctx <|> JsonTypes.remoteAddress ctx
+                                    selectVariant variants identifier name
         }
     )
     where
@@ -114,17 +114,17 @@ fromJsonFeature segmentMap jsonFeature =
 
         strategyPredicates :: MonadIO m => [JsonTypes.Context -> m Bool]
         strategyPredicates =
-            fmap (fromJsonStrategy jsonFeature.name segmentMap) jsonFeature.strategies
+            fmap (fromJsonStrategy name segmentMap) strategies
 
         enabledByOverride :: [Variant] -> JsonTypes.Context -> Maybe Variant
         enabledByOverride variants ctx =
             find
-                ( \variant -> case variant.overrides of
+                ( \variant -> case JsonTypes.overrides variant of
                     Nothing -> False
                     Just overrides ->
                         any
-                            ( \override ->
-                                lookupContextValue override.contextName ctx `elem` (Just <$> override.values)
+                            ( \(JsonTypes.Override contextName values) ->
+                                lookupContextValue contextName ctx `elem` (Just <$> values)
                             )
                             overrides
                 )
@@ -134,41 +134,41 @@ fromJsonFeature segmentMap jsonFeature =
         selectVariant variants maybeIdentifier featureName = do
             randomValue <- generateRandomText
             let identifier = fromMaybe randomValue maybeIdentifier
-                weights = (.weight) <$> variants
+                weights = (JsonTypes.weight) <$> variants
                 hashed = getNormalizedNumberN identifier featureName (fromIntegral $ sum weights)
                 accumulated = tail $ scanl (+) 0 weights
                 zipped = zip accumulated variants
                 maybeVariant = snd <$> find (\(acc, _) -> acc >= hashed) zipped
              in case maybeVariant of
                     Nothing -> pure emptyVariantResponse
-                    Just variant ->
+                    Just (JsonTypes.Variant name payload _ _ _) ->
                         pure $
                             VariantResponse
-                                { name = variant.name,
-                                  payload = variant.payload,
+                                { name = name,
+                                  payload = payload,
                                   enabled = True
                                 }
 
 fromJsonStrategy :: MonadIO m => FeatureToggleName -> Map Int [JsonTypes.Constraint] -> JsonTypes.Strategy -> (JsonTypes.Context -> m Bool)
-fromJsonStrategy featureToggleName segmentMap jsonStrategy =
+fromJsonStrategy featureToggleName segmentMap (JsonTypes.Strategy name parameters constraints segments) =
     \ctx -> liftA2 (&&) (strategyFunction ctx) (constraintsPredicate ctx)
     where
         strategyFunction :: MonadIO m => JsonTypes.Context -> m Bool
         strategyFunction =
-            case jsonStrategy.name of
+            case name of
                 "default" -> pure . \_ctx -> True
                 "userWithId" ->
                     pure . \ctx ->
                         let strategy params =
                                 let userIds = maybe [] (Text.splitOn ", ") (Map.lookup "userIds" params)
-                                 in ctx.userId `elem` (Just <$> userIds)
-                         in evaluateStrategy strategy jsonStrategy.parameters
+                                 in JsonTypes.userId ctx `elem` (Just <$> userIds)
+                         in evaluateStrategy strategy parameters
                 "gradualRolloutUserId" ->
                     pure . \ctx ->
-                        case ctx.userId of
+                        case JsonTypes.userId ctx of
                             Nothing -> False
                             Just userId ->
-                                evaluateStrategy strategy jsonStrategy.parameters
+                                evaluateStrategy strategy parameters
                                 where
                                     strategy params =
                                         let percentage = getInt "percentage" params
@@ -177,10 +177,10 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                                          in normValue <= percentage
                 "gradualRolloutSessionId" ->
                     pure . \ctx ->
-                        case ctx.sessionId of
+                        case JsonTypes.sessionId ctx of
                             Nothing -> False
                             Just sessionId ->
-                                evaluateStrategy strategy jsonStrategy.parameters
+                                evaluateStrategy strategy parameters
                                 where
                                     strategy params =
                                         let percentage = getInt "percentage" params
@@ -188,7 +188,7 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                                             normValue = getNormalizedNumber sessionId groupId
                                          in normValue <= percentage
                 "gradualRolloutRandom" -> \_ctx -> do
-                    case jsonStrategy.parameters of
+                    case parameters of
                         Nothing -> pure False
                         Just params -> do
                             let percentage = getInt "percentage" params
@@ -198,8 +198,8 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                     pure . \ctx ->
                         let strategy params =
                                 let remoteAddresses = maybe [] (Text.splitOn ", ") (Map.lookup "IPs" params)
-                                 in ctx.remoteAddress `elem` (Just <$> remoteAddresses)
-                         in evaluateStrategy strategy jsonStrategy.parameters
+                                 in JsonTypes.remoteAddress ctx `elem` (Just <$> remoteAddresses)
+                         in evaluateStrategy strategy parameters
                 "flexibleRollout" -> \ctx -> do
                     randomValue <- generateRandomText
                     let strategy params =
@@ -210,14 +210,14 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                                     "default" ->
                                         normalizedNumber <= rollout
                                         where
-                                            identifier = fromMaybe randomValue (ctx.userId <|> ctx.sessionId <|> ctx.remoteAddress)
+                                            identifier = fromMaybe randomValue (JsonTypes.userId ctx <|> JsonTypes.sessionId ctx <|> JsonTypes.remoteAddress ctx)
                                             normalizedNumber = getNormalizedNumber identifier groupId
                                     "userId" ->
-                                        case ctx.userId of
+                                        case JsonTypes.userId ctx of
                                             Nothing -> False
                                             Just userId -> getNormalizedNumber userId groupId <= rollout
                                     "sessionId" ->
-                                        case ctx.sessionId of
+                                        case JsonTypes.sessionId ctx of
                                             Nothing -> False
                                             Just sessionId -> getNormalizedNumber sessionId groupId <= rollout
                                     customField ->
@@ -225,7 +225,7 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                                             Nothing -> False
                                             Just customValue ->
                                                 getNormalizedNumber customValue groupId <= rollout
-                     in pure $ evaluateStrategy strategy jsonStrategy.parameters
+                     in pure $ evaluateStrategy strategy parameters
                 -- Unknown strategy
                 _ -> pure . \_ctx -> False
 
@@ -235,10 +235,10 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
 
         constraintsPredicate :: MonadIO m => JsonTypes.Context -> m Bool
         constraintsPredicate ctx = do
-            let segmentReferences = concat jsonStrategy.segments
+            let segmentReferences = concat segments
                 maybeSegmentConstraints = segmentsToConstraints segmentReferences segmentMap
                 segmentConstraints = catMaybes maybeSegmentConstraints
-                strategyConstraints = fromMaybe [] jsonStrategy.constraints
+                strategyConstraints = fromMaybe [] constraints
                 allConstraints = segmentConstraints <> strategyConstraints
                 allPredicates = fromJsonConstraint <$> allConstraints
                 allSegmentConstraintsAreReferredTo = not $ Nothing `elem` maybeSegmentConstraints
@@ -250,52 +250,52 @@ fromJsonStrategy featureToggleName segmentMap jsonStrategy =
                 evaluatePredicate f = f ctx
 
 fromJsonConstraint :: JsonTypes.Constraint -> (JsonTypes.Context -> Bool)
-fromJsonConstraint constraint = \ctx -> do
+fromJsonConstraint (JsonTypes.Constraint contextName operator values caseInsensitive inverted value) = \ctx -> do
     let constraintValues =
-            if fromMaybe False constraint.caseInsensitive
-                then Text.toLower <$> fromMaybe [] constraint.values
-                else fromMaybe [] constraint.values
+            if fromMaybe False caseInsensitive
+                then Text.toLower <$> fromMaybe [] values
+                else fromMaybe [] values
 
     let mCurrentValue = do
-            let tmpValue :: Maybe Text = lookupContextValue constraint.contextName ctx
-            if fromMaybe False constraint.caseInsensitive
+            let tmpValue :: Maybe Text = lookupContextValue contextName ctx
+            if fromMaybe False caseInsensitive
                 then (Text.toLower <$> tmpValue)
                 else tmpValue
 
     let result =
-            case constraint.operator of
+            case operator of
                 "IN" -> mCurrentValue `isIn` constraintValues
                 "NOT_IN" -> mCurrentValue `isNotIn` constraintValues
                 "STR_STARTS_WITH" -> mCurrentValue `startsWithAnyOf` constraintValues
                 "STR_ENDS_WITH" -> mCurrentValue `endsWithAnyOf` constraintValues
                 "STR_CONTAINS" -> mCurrentValue `containsAnyOf` constraintValues
-                "NUM_EQ" -> numPredicate (==) mCurrentValue constraint.value
-                "NUM_GT" -> numPredicate (>) mCurrentValue constraint.value
-                "NUM_GTE" -> numPredicate (>=) mCurrentValue constraint.value
-                "NUM_LTE" -> numPredicate (<=) mCurrentValue constraint.value
-                "NUM_LT" -> numPredicate (<) mCurrentValue constraint.value
-                "DATE_AFTER" -> datePredicate (>) mCurrentValue constraint.value
-                "DATE_BEFORE" -> datePredicate (<) mCurrentValue constraint.value
-                "SEMVER_EQ" -> semVerPredicate (==) mCurrentValue constraint.value
-                "SEMVER_GT" -> semVerPredicate (>) mCurrentValue constraint.value
-                "SEMVER_LT" -> semVerPredicate (<) mCurrentValue constraint.value
+                "NUM_EQ" -> numPredicate (==) mCurrentValue value
+                "NUM_GT" -> numPredicate (>) mCurrentValue value
+                "NUM_GTE" -> numPredicate (>=) mCurrentValue value
+                "NUM_LTE" -> numPredicate (<=) mCurrentValue value
+                "NUM_LT" -> numPredicate (<) mCurrentValue value
+                "DATE_AFTER" -> datePredicate (>) mCurrentValue value
+                "DATE_BEFORE" -> datePredicate (<) mCurrentValue value
+                "SEMVER_EQ" -> semVerPredicate (==) mCurrentValue value
+                "SEMVER_GT" -> semVerPredicate (>) mCurrentValue value
+                "SEMVER_LT" -> semVerPredicate (<) mCurrentValue value
                 _ -> False
 
-    if fromMaybe False constraint.inverted
+    if fromMaybe False inverted
         then not result
         else result
 
 lookupContextValue :: Text -> JsonTypes.Context -> Maybe Text
-lookupContextValue key ctx =
+lookupContextValue key (JsonTypes.Context userId sessionId remoteAddress currentTime environment appName properties) =
     case key of
-        "appName" -> ctx.appName
-        "currentTime" -> ctx.currentTime
-        "environment" -> ctx.environment
-        "remoteAddress" -> ctx.remoteAddress
-        "sessionId" -> ctx.sessionId
-        "userId" -> ctx.userId
+        "appName" -> appName
+        "currentTime" -> currentTime
+        "environment" -> environment
+        "remoteAddress" -> remoteAddress
+        "sessionId" -> sessionId
+        "userId" -> userId
         propertiesKey -> do
-            m <- ctx.properties
+            m <- properties
             value <- Map.lookup propertiesKey m
             value
 
