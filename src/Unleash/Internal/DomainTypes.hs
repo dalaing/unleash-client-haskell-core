@@ -160,7 +160,7 @@ fromJsonStrategy featureToggleName segmentMap (JsonTypes.Strategy name parameter
                 "userWithId" ->
                     pure . \ctx ->
                         let strategy params =
-                                let userIds = maybe [] (Text.splitOn ", ") (Map.lookup "userIds" params)
+                                let userIds = maybe [] (fmap Text.strip . Text.splitOn ",") (Map.lookup "userIds" params)
                                  in JsonTypes.userId ctx `elem` (Just <$> userIds)
                          in evaluateStrategy strategy parameters
                 "gradualRolloutUserId" ->
